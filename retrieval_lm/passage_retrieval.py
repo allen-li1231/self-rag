@@ -24,6 +24,8 @@ import src.data
 from src.evaluation import calculate_matches
 import src.normalize_text
 
+from src.utils import DEVICE
+
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 
@@ -52,7 +54,7 @@ class Retriever:
                         padding=True,
                         truncation=True,
                     )
-                    encoded_batch = {k: v.cuda() for k, v in encoded_batch.items()}
+                    encoded_batch = {k: v.to(DEVICE) for k, v in encoded_batch.items()}
                     output = self.model(**encoded_batch)
                     embeddings.append(output.cpu())
 
@@ -79,7 +81,7 @@ class Retriever:
                         padding=True,
                         truncation=True,
                     )
-                    encoded_batch = {k: v.cuda() for k, v in encoded_batch.items()}
+                    encoded_batch = {k: v.to(DEVICE) for k, v in encoded_batch.items()}
                     output = self.model(**encoded_batch)
                     embeddings.append(output.cpu())
 
@@ -128,7 +130,7 @@ class Retriever:
         print(f"Loading model from: {self.args.model_name_or_path}")
         self.model, self.tokenizer, _ = src.contriever.load_retriever(self.args.model_name_or_path)
         self.model.eval()
-        self.model = self.model.cuda()
+        self.model = self.model.to(DEVICE)
         if not self.args.no_fp16:
             self.model = self.model.half()
 
@@ -179,7 +181,7 @@ class Retriever:
         print(f"Loading model from: {model_name_or_path}")
         self.model, self.tokenizer, _ = src.contriever.load_retriever(model_name_or_path)
         self.model.eval()
-        self.model = self.model.cuda()
+        self.model = self.model.to(DEVICE)
 
         self.index = src.index.Indexer(768, 0, 8)
 

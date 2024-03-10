@@ -14,6 +14,8 @@ Number = Union[float, int]
 
 logger = logging.getLogger(__name__)
 
+DEVICE = dist_utils.DEVICE
+
 
 def init_logger(args, stdout_only=False):
     if torch.distributed.is_initialized():
@@ -73,7 +75,7 @@ def load(model_class, dir_path, opt, reset_params=False):
 
     model = model_class(opt_checkpoint)
     model.load_state_dict(state_dict, strict=True)
-    model = model.cuda()
+    model = model.to(DEVICE)
     step = checkpoint["step"]
     if not reset_params:
         optimizer, scheduler = set_optim(opt_checkpoint, model)

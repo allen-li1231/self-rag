@@ -118,7 +118,7 @@ class MoCo(nn.Module):
         logits = self._compute_logits(q, k) / self.temperature
 
         # labels: positive key indicators
-        labels = torch.zeros(bsz, dtype=torch.long).cuda()
+        labels = torch.zeros(bsz, dtype=torch.long).to(utils.DEVICE)
 
         loss = torch.nn.functional.cross_entropy(logits, labels, label_smoothing=self.label_smoothing)
 

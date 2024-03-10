@@ -17,6 +17,7 @@ from beir.reranking import Rerank
 
 import src.dist_utils as dist_utils
 from src import normalize_text
+from utils import DEVICE
 
 
 class DenseEncoderModel:
@@ -71,12 +72,12 @@ class DenseEncoderModel:
                     add_special_tokens=self.add_special_tokens,
                     return_tensors="pt",
                 )
-                qencode = {key: value.cuda() for key, value in qencode.items()}
+                qencode = {key: value.to(DEVICE) for key, value in qencode.items()}
                 emb = self.query_encoder(**qencode, normalize=self.norm_query)
                 allemb.append(emb.cpu())
 
         allemb = torch.cat(allemb, dim=0)
-        allemb = allemb.cuda()
+        allemb = allemb.to(DEVICE)
         if dist.is_initialized():
             allemb = dist_utils.varsize_gather_nograd(allemb)
         allemb = allemb.cpu().numpy()
@@ -110,12 +111,12 @@ class DenseEncoderModel:
                     add_special_tokens=self.add_special_tokens,
                     return_tensors="pt",
                 )
-                cencode = {key: value.cuda() for key, value in cencode.items()}
+                cencode = {key: value.to(DEVICE) for key, value in cencode.items()}
                 emb = self.doc_encoder(**cencode, normalize=self.norm_doc)
                 allemb.append(emb.cpu())
 
         allemb = torch.cat(allemb, dim=0)
-        allemb = allemb.cuda()
+        allemb = allemb.to(DEVICE)
         if dist.is_initialized():
             allemb = dist_utils.varsize_gather_nograd(allemb)
         allemb = allemb.cpu().numpy()

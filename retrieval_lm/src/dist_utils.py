@@ -3,6 +3,8 @@
 import torch
 import torch.distributed as dist
 
+DEVICE = "mps"
+
 
 class Gather(torch.autograd.Function):
     @staticmethod
@@ -121,8 +123,8 @@ def weighted_average(x, count):
         if isinstance(x, torch.Tensor):
             x = x.item()
         return x, count
-    t_loss = torch.tensor([x * count]).cuda()
-    t_total = torch.tensor([count]).cuda()
+    t_loss = torch.tensor([x * count]).to(DEVICE)
+    t_total = torch.tensor([count]).to(DEVICE)
     t_loss = sum_main(t_loss)
     t_total = sum_main(t_total)
     return (t_loss / t_total).item(), t_total.item()

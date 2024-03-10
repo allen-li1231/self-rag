@@ -22,6 +22,8 @@ import src.utils
 import src.data
 import src.normalize_text
 
+from src.utils import DEVICE
+
 
 def embed_passages(args, passages, model, tokenizer):
     total = 0
@@ -50,7 +52,7 @@ def embed_passages(args, passages, model, tokenizer):
                     truncation=True,
                 )
 
-                encoded_batch = {k: v.cuda() for k, v in encoded_batch.items()}
+                encoded_batch = {k: v.to(DEVICE) for k, v in encoded_batch.items()}
                 embeddings = model(**encoded_batch)
 
                 embeddings = embeddings.cpu()
@@ -71,7 +73,7 @@ def main(args):
     model, tokenizer, _ = src.contriever.load_retriever(args.model_name_or_path)
     print(f"Model loaded from {args.model_name_or_path}.", flush=True)
     model.eval()
-    model = model.cuda()
+    model = model.to(DEVICE)
     if not args.no_fp16:
         model = model.half()
 
