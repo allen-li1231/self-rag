@@ -87,7 +87,7 @@ def model_generate(prompt, model,
         pred_token_ids = preds.sequences[:, inputs.input_ids.shape[1]:].to("cpu").numpy()
         pred_text = tokenizer.batch_decode(pred_token_ids)
         pred_log_probs = F.log_softmax(torch.stack(preds.scores), dim=2)
-        pred_log_probs = torch.swapaxes(pred_log_probs, 0, 1)
+        pred_log_probs = torch.swapaxes(pred_log_probs, 0, 1).to("cpu").numpy()
 
     else:
         from vllm import SamplingParams
@@ -117,14 +117,12 @@ def postprocess_answer_option_conditioned(answer):
     return answer
 
 
-def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15,
+def call_model_rerank_w_scores_batch(prompt, evidences, model, tokenizer=None, max_new_tokens=15,
                                      ret_tokens=None, rel_tokens=None, grd_tokens=None, ut_tokens=None,
                                      use_seqscore=False, threshold=0.5, beam_width=2,
                                      w_rel=1.0, w_sup=1.0, w_use=0.5, mode="adaptive_retrieval", closed=False):
     results = {}
-    tokenizer = AutoTokenizer.from_pretrained(model.name_or_path, padding="longest", padding_side="left") \
-                if DEVICE == "mps" else None
-        
+
     if mode != "always_retrieve":
         pred_text, pred_token_ids, pred_log_probs = model_generate(
             prompt, model, tokenizer=tokenizer, max_new_tokens=max_new_tokens,
@@ -365,8 +363,8 @@ def main():
         input_data, task=args.task)
     tokenizer = AutoTokenizer.from_pretrained(gpt, padding="longest", padding_side="left")
     if DEVICE == 'mps':
-        model = AutoModelForCausalLM.from_pretrained(gpt, device_map=DEVICE)
-        model.eval()
+        model = AutoModelForCausalLM.from_pretrained(gpt, torch_dtype="auto", device_map=DEVICE)
+        model = model.eval()
     else:
         from vllm import LLM
         if args.dtype is not None:
@@ -381,7 +379,8 @@ def main():
         tokenizer, use_grounding=args.use_groundness, use_utility=args.use_utility)
 
     def generate(prompt, evidences, max_new_tokens):
-        return call_model_rerank_w_scores_batch(prompt, evidences=evidences, model=model, max_new_tokens=max_new_tokens,
+        tk = tokenizer if DEVICE == "mps" else None
+        return call_model_rerank_w_scores_batch(prompt, evidences=evidences, model=model, tokenizer=tk, max_new_tokens=max_new_tokens,
                                                 rel_tokens=rel_tokens, ret_tokens=ret_tokens, grd_tokens=grd_tokens, ut_tokens=ut_tokens,
                                                 beam_width=args.beam_width, threshold=args.threshold, use_seqscore=args.use_seqscore,
                                                 w_rel=args.w_rel, w_sup=args.w_sup, w_use=args.w_use, mode=args.mode, closed=args.task in ["fever", "arc_c"])
@@ -395,8 +394,7 @@ def main():
     count = 0
     for i, row in tqdm(enumerate(input_data)):
         results = {}
-        prompt = PROMPT_DICT["prompt_no_input"].format_map(row)
-        _, evidences = process_data_evidences(row, top_n=args.ndocs)
+        prompt, evidences = process_data_evidences(row, top_n=args.ndocs)
         pred, results, do_retrieve = generate(
             prompt, evidences, max_new_tokens=args.max_new_tokens,)
         if type(pred) is str and pred[0] == "#" or pred[0] == ":":
