@@ -1,16 +1,25 @@
-#!/usr/bin/python
-# -*- coding: UTF-8 -*-
-
 import spacy
 import jsonlines
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from vllm import LLM, SamplingParams
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    LlamaTokenizer,
+    LlamaTokenizerFast,
+    SchedulerType,
+    DataCollatorForSeq2Seq,
+    get_scheduler,
+    GPTNeoXTokenizerFast,
+    GPT2Tokenizer,
+    OPTForCausalLM,
+    StoppingCriteria,
+    StoppingCriteriaList
+)
 import random
 import torch
+import torch.nn.functional as F
 import os
 import numpy as np
-import openai
-from tqdm import tqdm
 import json
 import argparse
 import ast
@@ -20,17 +29,77 @@ from collections import Counter
 import string
 import sys
 import time
+from src.utils import DEVICE
 from utils import PROMPT_DICT, TASK_INST, load_jsonlines, control_tokens, load_special_tokens
 from metrics import match, accuracy
 
 
 seed = 633
 
-torch.backends.cudnn.deterministic = True
+if torch.cuda.is_available():
+    torch.backends.cudnn.deterministic = True
+    torch.cuda.manual_seed_all(seed)
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
+
+
+def model_generate(prompt, model,
+                   tokenizer=None,
+                   temperature=0.8,
+                   max_new_tokens=1024,
+                   top_k=1,
+                   top_p=1.,
+                   beam_width=1,
+                   do_sample=False,
+                   num_return_sequences=1
+):
+
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    if DEVICE == "mps":
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(model.name_or_path,)
+        inputs = tokenizer(prompt, padding="longest", return_tensors="pt").to(DEVICE)
+        if temperature <= 0.:
+            preds = model.generate(
+                **inputs,
+                top_p=top_p,
+                num_beams=beam_width,
+                temperature=None,
+                do_sample=False,
+                max_new_tokens=max_new_tokens,
+                num_return_sequences=num_return_sequences,
+                output_scores=True,
+                return_dict_in_generate=True)
+        else:
+            preds = model.generate(
+                **inputs,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                num_beams=beam_width,
+                do_sample=do_sample,
+                max_new_tokens=max_new_tokens,
+                num_return_sequences=num_return_sequences,
+                output_scores=True,
+                return_dict_in_generate=True)
+
+        pred_token_ids = preds.sequences[:, inputs.input_ids.shape[1]:].to("cpu").numpy()
+        pred_text = tokenizer.batch_decode(pred_token_ids)
+        pred_log_probs = F.log_softmax(torch.stack(preds.scores), dim=2)
+        pred_log_probs = torch.swapaxes(pred_log_probs, 0, 1)
+
+    else:
+        from vllm import SamplingParams
+        sampling_params = SamplingParams(
+            temperature=temperature, top_p=top_p, max_tokens=max_new_tokens,
+            use_beam_search=True, n=num_return_sequences, logprobs=32016)
+        preds = model.generate(prompt, sampling_params)
+        pred_token_ids = [[output.token_ids for output in p.outputs[: num_return_sequences]] for p in preds]
+        pred_text = [[output.text for output in p.outputs[: num_return_sequences]] for p in preds]
+        pred_log_probs = [[output.logprobs for output in p.outputs[: num_return_sequences]] for p in preds]
+
+    return pred_text, pred_token_ids, pred_log_probs
 
 
 def postprocess_answer_option_conditioned(answer):
@@ -50,17 +119,20 @@ def postprocess_answer_option_conditioned(answer):
 
 def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15,
                                      ret_tokens=None, rel_tokens=None, grd_tokens=None, ut_tokens=None,
-                                     use_seqscore=False, threshold=0.5,
+                                     use_seqscore=False, threshold=0.5, beam_width=2,
                                      w_rel=1.0, w_sup=1.0, w_use=0.5, mode="adaptive_retrieval", closed=False):
     results = {}
+    tokenizer = AutoTokenizer.from_pretrained(model.name_or_path, padding="longest", padding_side="left") \
+                if DEVICE == "mps" else None
+        
     if mode != "always_retrieve":
-        sampling_params = SamplingParams(
-            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=32016)
-        preds = model.generate([prompt], sampling_params)
-        pred_token_ids = preds[0].outputs[0].token_ids
-        pred_text = preds[0].outputs[0].text
-        pred_log_probs = preds[0].outputs[0].logprobs
-        results["no_retrieval"] = pred_text
+        pred_text, pred_token_ids, pred_log_probs = model_generate(
+            prompt, model, tokenizer=tokenizer, max_new_tokens=max_new_tokens,
+            temperature=0., top_p=1., beam_width=beam_width, num_return_sequences=1
+        )
+        results["no_retrieval"] = pred_text[0]
+        pred_token_ids = pred_token_ids[0]
+        pred_log_probs = pred_log_probs[0]
 
     # save relevance token scores
     if mode == "always_retrieve":
@@ -80,55 +152,52 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
             do_retrieve = score_dict["[Retrieval]"] / (
                 score_dict["[Retrieval]"] + score_dict["[No Retrieval]"]) > threshold
         else:
-            do_retrieve = "[Retrieval]" in pred
+            do_retrieve = "[Retrieval]" in pred_text
 
     if do_retrieve is True:
         evidence_augmented_inputs = [prompt + "[Retrieval]<paragraph>{0}\n{1}</paragraph>".format(
             para["title"], para["text"]) for para in evidences]
-        sampling_params = SamplingParams(
-            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=5000)
-        preds = model.generate(evidence_augmented_inputs, sampling_params)
-
+        lst_pred_text, lst_pred_token_ids, lst_pred_log_probs = model_generate(
+            evidence_augmented_inputs, model, tokenizer=tokenizer, max_new_tokens=max_new_tokens,
+            temperature=0., top_p=1., beam_width=beam_width, num_return_sequences=1
+        )
         relevance_score_dict = {}
         grd_score_dict = {}
         ut_score_dict = {}
         overall_scores = {}
-        for p_idx, pred in enumerate(preds):
-            pred_token_ids = pred.outputs[0].token_ids
-            pred_text = pred.outputs[0].text
-            pred_log_probs = pred.outputs[0].logprobs
-            seq_score = pred.outputs[0].cumulative_logprob / \
-                max(len(pred.outputs[0].token_ids), 1)
+        for p_idx, (pred_text, pred_token_ids, pred_log_probs) \
+            in enumerate(zip(lst_pred_text, lst_pred_token_ids, lst_pred_log_probs)):
+            cumulative_logprob = pred_log_probs.sum()
+            seq_score = cumulative_logprob / max(len(pred_log_probs), 1)
 
             relevance_score_dict.setdefault(p_idx, {})
             grd_score_dict.setdefault(p_idx, {})
             ut_score_dict.setdefault(p_idx, {})
             # Compute reward scores
             for tok, id in rel_tokens.items():
-                prob = pred_log_probs[0][id] if id in pred_log_probs[0] else -100
+                prob = pred_log_probs[0][id]
                 relevance_score_dict[p_idx][tok] = np.exp(float(prob))
 
             if grd_tokens is not None:
-                groundness_token_appear_indices = []
+                idx = -1
                 for tok_idx, tok in enumerate(pred_token_ids):
-                    if tok in list(grd_tokens.values()):
-                        groundness_token_appear_indices.append(tok_idx)
+                    if tok in grd_tokens.values():
+                        idx = tok_idx
                         break
-                if len(groundness_token_appear_indices) > 0:
-                    idx = groundness_token_appear_indices[0]
+                if idx >= 0:
                     for token, token_id in grd_tokens.items():
-                        prob = pred_log_probs[idx][token_id] if token_id in pred_log_probs[idx] else -100
+                        prob = pred_log_probs[idx][token_id]
                         grd_score_dict[p_idx][token] = np.exp(float(prob))
 
             if ut_tokens is not None:
-                utility_token_appear_indices = []
+                idx = -1
                 for tok_idx, tok in enumerate(pred_token_ids):
-                    if tok in list(ut_tokens.values()):
-                        utility_token_appear_indices.append(tok_idx)
-                if len(utility_token_appear_indices) > 0:
-                    idx = utility_token_appear_indices[0]
+                    if tok in ut_tokens.values():
+                        idx = tok_idx
+                        break
+                if idx >= 0:
                     for token, token_id in ut_tokens.items():
-                        prob = pred_log_probs[idx][token_id] if token_id in pred_log_probs[idx] else -100
+                        prob = pred_log_probs[idx][token_id]
                         ut_score_dict[p_idx][token] = np.exp(float(prob))
 
             relevance_score = relevance_score_dict[p_idx]["[Relevant]"] / (
@@ -167,12 +236,11 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
                 "pred": pred_text, "score": final_score, "ctx": evidences[p_idx]}
 
     else:
-        sampling_params = SamplingParams(
-            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens)
         prompt += "[No Retrieval]"
-        preds = model.generate([prompt], sampling_params)
-
-        pred = preds[0].outputs[0].text
+        pred, pred_token_ids, pred_log_probs = model_generate(
+            prompt, model, tokenizer=tokenizer, max_new_tokens=max_new_tokens,
+            temperature=0., top_p=1., beam_width=beam_width, num_return_sequences=1
+        )
 
     # Aggregating answers
     if len(results) == 1:
@@ -267,7 +335,7 @@ def main():
     parser.add_argument("--dtype",  type=str, default="half",
                         help="We use bfloat16 for training. If you run inference on GPUs that do not support BF16, please set this to be `half`.")
     # Decoding hyperparams
-    parser.add_argument('--threshold', type=float,
+    parser.add_argument('--threshold', type=float, 
                         default=None, help="Adaptive threshold.")
     parser.add_argument("--use_seqscore", action="store_true")
     parser.add_argument("--use_groundness", action="store_true",
@@ -276,13 +344,11 @@ def main():
         "--use_utility", action="store_true", help="tree search")
     parser.add_argument("--beam_width",  type=int,
                         default=2, help="beam search width")
-    parser.add_argument("--max_depth",  type=int,
-                        default=2, help="tree depth width")
     parser.add_argument("--w_rel",  type=float, default=1.0,
                         help="reward weight for document relevance")
     parser.add_argument("--w_sup",  type=float, default=1.0,
                         help="reward weight for generation support (attribution)")
-    parser.add_argument("--w_use",  type=float, default=1.0,
+    parser.add_argument("--w_use",  type=float, default=0.5,
                         help="reward weight for overall completeness / utility.")
     parser.add_argument('--mode', type=str, help="mode to control retrieval.",
                         default="default", choices=['adaptive_retrieval', 'no_retrieval', 'always_retrieve'],)
@@ -297,13 +363,18 @@ def main():
 
     input_data = preprocess_input_data(
         input_data, task=args.task)
-    tokenizer = AutoTokenizer.from_pretrained(gpt, padding_side="left")
-    if args.dtype is not None:
-        model = LLM(model=gpt, download_dir=args.download_dir,
-                    dtype=args.dtype, tensor_parallel_size=args.world_size,)
+    tokenizer = AutoTokenizer.from_pretrained(gpt, padding="longest", padding_side="left")
+    if DEVICE == 'mps':
+        model = AutoModelForCausalLM.from_pretrained(gpt, device_map=DEVICE)
+        model.eval()
     else:
-        model = LLM(model=gpt, download_dir=args.download_dir,
-                    dtype=args.dtype, tensor_parallel_size=args.world_size,)
+        from vllm import LLM
+        if args.dtype is not None:
+            model = LLM(model=gpt, download_dir=args.download_dir,
+                        dtype=args.dtype, tensor_parallel_size=args.world_size,)
+        else:
+            model = LLM(model=gpt, download_dir=args.download_dir,
+                        dtype=args.dtype, tensor_parallel_size=args.world_size,)
 
     # Get token ids for reflection tokens.
     ret_tokens, rel_tokens, grd_tokens, ut_tokens = load_special_tokens(
@@ -312,7 +383,7 @@ def main():
     def generate(prompt, evidences, max_new_tokens):
         return call_model_rerank_w_scores_batch(prompt, evidences=evidences, model=model, max_new_tokens=max_new_tokens,
                                                 rel_tokens=rel_tokens, ret_tokens=ret_tokens, grd_tokens=grd_tokens, ut_tokens=ut_tokens,
-                                                threshold=args.threshold, max_depth=args.max_depth, use_seqscore=args.use_seqscore,
+                                                beam_width=args.beam_width, threshold=args.threshold, use_seqscore=args.use_seqscore,
                                                 w_rel=args.w_rel, w_sup=args.w_sup, w_use=args.w_use, mode=args.mode, closed=args.task in ["fever", "arc_c"])
 
     preds = []
